@@ -88,10 +88,14 @@ canvas {
     <button class="ctrl-item" id="music-btn">Music</button>
     <button class="ctrl-item" id="room-btn">Room</button>
     <button class="ctrl-item" id="battle-btn">Battle</button>
+    <button class="ctrl-item toggle-btn" id="symmetry-btn">Symmetry</button>
+    <button class="ctrl-item" id="image-btn">Image</button>
+    <button class="ctrl-item" id="bg-btn">BG: Dark</button>
 </div>
 
 <!-- Music file input (hidden) -->
 <input type="file" id="music-file" accept="audio/*" style="display:none">
+<input type="file" id="image-file" accept="image/*" style="display:none">
 
 <!-- Room overlay -->
 <div id="room-overlay" style="display:none; position:fixed; top:50%; left:50%; transform:translate(-50%,-50%);
@@ -634,6 +638,94 @@ void main() {
 `).replace(/texture\(/g, isWebGL2 ? 'texture(' : 'texture2D(');
 
 
+// --- Image distortion display shader ---
+// Uses the velocity field to distort a loaded image in real-time
+const imageDistortFrag = fragSource(`
+uniform sampler2D uImage;
+uniform sampler2D uVelocity;
+uniform sampler2D uDye;
+uniform sampler2D uBloom0;
+uniform sampler2D uBloom1;
+uniform sampler2D uBloom2;
+uniform float bloomIntensity;
+uniform vec2 texelSize;
+uniform float distortStrength;
+uniform float dyeBlend;
+void main() {
+    vec2 vel = texture(uVelocity, vUv).xy;
+    // Distort UV by velocity
+    vec2 distorted = vUv - vel * texelSize * distortStrength;
+    vec3 img = texture(uImage, distorted).rgb;
+    vec3 dyeColor = texture(uDye, vUv).rgb;
+    // Blend dye on top of distorted image
+    vec3 color = mix(img, img + dyeColor, dyeBlend);
+    // Add bloom
+    vec3 bloom = texture(uBloom0, vUv).rgb * 0.5
+               + texture(uBloom1, vUv).rgb * 0.3
+               + texture(uBloom2, vUv).rgb * 0.2;
+    color += bloom * bloomIntensity;
+    color = color / (1.0 + color);
+    color = pow(color, vec3(1.0 / 2.2));
+    fragColor = vec4(color, 1.0);
+}
+`).replace(/texture\(/g, isWebGL2 ? 'texture(' : 'texture2D(');
+
+// --- Background texture display shader ---
+// Composites fluid on top of a procedural or loaded background
+const bgDisplayFrag = fragSource(`
+uniform sampler2D uDye;
+uniform sampler2D uBloom0;
+uniform sampler2D uBloom1;
+uniform sampler2D uBloom2;
+uniform float bloomIntensity;
+uniform int bgType; // 0=dark, 1=marble, 2=watercolor paper, 3=gradient
+uniform float time;
+void main() {
+    vec3 bg;
+    vec2 uv = vUv;
+
+    if (bgType == 1) {
+        // Marble: layered sine waves
+        float n = sin(uv.x * 8.0 + sin(uv.y * 6.0 + time * 0.1) * 2.0) * 0.5 + 0.5;
+        n += sin(uv.y * 12.0 + sin(uv.x * 8.0) * 1.5) * 0.3;
+        n = smoothstep(0.3, 0.7, n);
+        bg = mix(vec3(0.92, 0.90, 0.87), vec3(0.75, 0.72, 0.68), n);
+        bg = mix(bg, vec3(0.95, 0.93, 0.90), smoothstep(0.0, 0.3, sin(uv.x * 20.0 + uv.y * 15.0) * 0.5 + 0.5));
+    } else if (bgType == 2) {
+        // Watercolor paper: subtle warm texture
+        float grain = fract(sin(dot(uv * 200.0, vec2(12.9898, 78.233))) * 43758.5453);
+        float fiber = sin(uv.x * 80.0) * sin(uv.y * 60.0) * 0.03;
+        bg = vec3(0.96, 0.94, 0.90) + grain * 0.04 + fiber;
+    } else if (bgType == 3) {
+        // Deep gradient: dark blue to dark purple
+        bg = mix(vec3(0.02, 0.02, 0.08), vec3(0.08, 0.02, 0.12), uv.y);
+        bg += mix(vec3(0.0), vec3(0.03, 0.01, 0.05), sin(uv.x * 3.14159) * sin(uv.y * 3.14159));
+    } else {
+        bg = vec3(0.0);
+    }
+
+    vec3 dyeColor = texture(uDye, vUv).rgb;
+    vec3 bloom = texture(uBloom0, vUv).rgb * 0.5
+               + texture(uBloom1, vUv).rgb * 0.3
+               + texture(uBloom2, vUv).rgb * 0.2;
+    vec3 fluid = dyeColor + bloom * bloomIntensity;
+
+    // Compose fluid on background
+    float fluidAlpha = clamp(length(fluid) * 1.5, 0.0, 1.0);
+    vec3 color;
+    if (bgType == 0) {
+        // Dark mode: standard rendering
+        color = fluid / (1.0 + fluid);
+    } else {
+        // Light/textured bg: fluid paints on top
+        color = mix(bg, bg + fluid * 0.8, fluidAlpha);
+        color = clamp(color, 0.0, 1.0);
+    }
+    color = pow(color, vec3(1.0 / 2.2));
+    fragColor = vec4(color, 1.0);
+}
+`).replace(/texture\(/g, isWebGL2 ? 'texture(' : 'texture2D(');
+
 // --- Obstacle draw shader: draws a filled circle into obstacle texture ---
 const obstacleDrawFrag = fragSource(`
 uniform vec2 point;
@@ -764,9 +856,14 @@ const config = {
     WALLS_MODE: false,
     WELLS_MODE: false,
     WALL_RADIUS: 0.015,
+    SYMMETRY: 0,         // 0=off, 2=mirror, 4=4-fold, 6=6-fold, 8=8-fold
+    BG_TYPE: 0,          // 0=dark, 1=marble, 2=watercolor, 3=gradient
+    IMAGE_MODE: false,
+    IMAGE_DISTORT_STRENGTH: 15.0,
+    IMAGE_DYE_BLEND: 0.5,
 };
 
-// Colour palettes
+// Colour palettes — curated for art
 const PALETTES = [
     // Vivid
     [[0.94, 0.13, 0.55], [0.0, 0.87, 0.87], [0.95, 0.87, 0.13], [0.29, 0.87, 0.13], [0.95, 0.55, 0.13], [0.95, 0.29, 0.66]],
@@ -777,12 +874,41 @@ const PALETTES = [
     // Neon
     [[1.0, 0.1, 0.5], [0.1, 0.5, 1.0], [0.1, 1.0, 0.3], [0.6, 0.1, 0.9], [1.0, 1.0, 0.1]],
     // Pastel
-    [[0.95, 0.7, 0.75], [0.7, 0.65, 0.95], [0.65, 0.95, 0.75], [0.95, 0.8, 0.65], [0.65, 0.8, 0.95]]
+    [[0.95, 0.7, 0.75], [0.7, 0.65, 0.95], [0.65, 0.95, 0.75], [0.95, 0.8, 0.65], [0.65, 0.8, 0.95]],
+    // Ink Wash (monochrome + accent)
+    [[0.1, 0.1, 0.15], [0.3, 0.3, 0.35], [0.5, 0.5, 0.55], [0.7, 0.7, 0.72], [0.9, 0.3, 0.2]],
+    // Aurora
+    [[0.0, 0.9, 0.4], [0.1, 0.6, 0.9], [0.4, 0.2, 0.8], [0.0, 0.8, 0.7], [0.8, 0.2, 0.6]],
+    // Rainbow (HSL golden ratio stepping)
+    'rainbow',
 ];
+const PALETTE_NAMES = ['Vivid', 'Ocean', 'Fire', 'Neon', 'Pastel', 'Ink', 'Aurora', 'Rainbow'];
+
+// HSL to RGB conversion
+function hslToRgb(h, s, l) {
+    h = ((h % 1) + 1) % 1;
+    const a = s * Math.min(l, 1 - l);
+    const f = (n) => {
+        const k = (n + h * 12) % 12;
+        return l - a * Math.max(-1, Math.min(k - 3, 9 - k, 1));
+    };
+    return [f(0), f(8), f(4)];
+}
+
+// Golden ratio color stepping for endless non-repeating harmonious colors
+const GOLDEN_RATIO = 0.618033988749895;
+let goldenHue = Math.random();
+
+function goldenRatioColor() {
+    goldenHue = (goldenHue + GOLDEN_RATIO) % 1.0;
+    const [r, g, b] = hslToRgb(goldenHue, 0.8, 0.55);
+    return { r, g, b };
+}
 
 let colorIndex = 0;
 function getNextColor() {
     const palette = PALETTES[config.paletteIndex];
+    if (palette === 'rainbow') return goldenRatioColor();
     const c = palette[colorIndex % palette.length];
     colorIndex++;
     return { r: c[0], g: c[1], b: c[2] };
@@ -790,6 +916,7 @@ function getNextColor() {
 
 function randomColor() {
     const palette = PALETTES[config.paletteIndex];
+    if (palette === 'rainbow') return goldenRatioColor();
     const c = palette[Math.floor(Math.random() * palette.length)];
     return { r: c[0], g: c[1], b: c[2] };
 }
@@ -814,6 +941,8 @@ const programs = {
     bloomThreshold: createProgram(VERT_SHADER, bloomThresholdFrag),
     bloomBlur: createProgram(VERT_SHADER, bloomBlurFrag),
     bloomComposite: createProgram(VERT_SHADER, bloomCompositeFrag),
+    imageDistort: createProgram(VERT_SHADER, imageDistortFrag),
+    bgDisplay: createProgram(VERT_SHADER, bgDisplayFrag),
     obstacleDraw: createProgram(VERT_SHADER, obstacleDrawFrag),
     obstacleDisplay: createProgram(VERT_SHADER, obstacleDisplayFrag),
     wellForce: createProgram(VERT_SHADER, wellForceFrag),
@@ -1254,6 +1383,99 @@ function clearObstacles() {
     gl.clearColor(0, 0, 0, 0);
     gl.clear(gl.COLOR_BUFFER_BIT);
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+}
+
+// ============================================================
+// SECTION 5d2: Image Loading & Distortion
+// ============================================================
+
+let imageTexture = null;
+let imageLoaded = false;
+
+function loadImage(file) {
+    const img = new Image();
+    img.onload = () => {
+        if (imageTexture) gl.deleteTexture(imageTexture);
+        imageTexture = gl.createTexture();
+        gl.bindTexture(gl.TEXTURE_2D, imageTexture);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, img);
+        imageLoaded = true;
+        config.IMAGE_MODE = true;
+        document.getElementById('image-btn').textContent = 'Image: On';
+        URL.revokeObjectURL(img.src);
+    };
+    img.src = URL.createObjectURL(file);
+}
+
+function attachImageTexture(unit) {
+    gl.activeTexture(gl.TEXTURE0 + unit);
+    gl.bindTexture(gl.TEXTURE_2D, imageTexture);
+    return unit;
+}
+
+// Drag and drop image support
+canvas.addEventListener('dragover', (e) => { e.preventDefault(); e.dataTransfer.dropEffect = 'copy'; });
+canvas.addEventListener('drop', (e) => {
+    e.preventDefault();
+    const file = e.dataTransfer.files[0];
+    if (file && file.type.startsWith('image/')) loadImage(file);
+});
+
+// Paste image support
+document.addEventListener('paste', (e) => {
+    const items = e.clipboardData.items;
+    for (const item of items) {
+        if (item.type.startsWith('image/')) {
+            loadImage(item.getAsFile());
+            break;
+        }
+    }
+});
+
+// ============================================================
+// SECTION 5d3: Symmetry System
+// ============================================================
+
+// Applies symmetrical splats around the centre
+function splatWithSymmetry(x, y, dx, dy, color) {
+    const sym = config.SYMMETRY;
+    if (sym === 0) {
+        splat(x, y, dx, dy, color);
+        return;
+    }
+
+    // Convert to centre-relative coordinates
+    const cx = x - 0.5;
+    const cy = y - 0.5;
+
+    if (sym === 2) {
+        // Mirror: horizontal reflection
+        splat(x, y, dx, dy, color);
+        splat(1.0 - x, y, -dx, dy, color);
+        return;
+    }
+
+    // Radial symmetry (4, 6, 8-fold)
+    const angle0 = Math.atan2(cy, cx);
+    const dist = Math.sqrt(cx * cx + cy * cy);
+    const dAngle0 = Math.atan2(dy, dx);
+    const dMag = Math.sqrt(dx * dx + dy * dy);
+
+    for (let i = 0; i < sym; i++) {
+        const a = angle0 + (i / sym) * Math.PI * 2;
+        const da = dAngle0 + (i / sym) * Math.PI * 2;
+        splat(
+            0.5 + Math.cos(a) * dist,
+            0.5 + Math.sin(a) * dist,
+            Math.cos(da) * dMag,
+            Math.sin(da) * dMag,
+            color
+        );
+    }
 }
 
 // ============================================================
@@ -1760,7 +1982,9 @@ function splatPointer(id) {
     if (!p) return;
     const dx = p.dx * config.SPLAT_FORCE;
     const dy = p.dy * config.SPLAT_FORCE;
-    splat(p.x, p.y, dx, dy, p.color);
+    splatWithSymmetry(p.x, p.y, dx, dy, p.color);
+    // Broadcast the original splat for multiplayer
+    broadcastMessage({ type: 'splat', x: p.x, y: p.y, dx, dy, color: p.color });
 }
 
 function splat(x, y, dx, dy, color) {
@@ -1929,6 +2153,8 @@ function step(dt) {
 function render() {
     if (config.CFD_MODE) {
         renderCFD();
+    } else if (config.IMAGE_MODE && imageLoaded) {
+        renderImageDistort();
     } else {
         renderInk();
     }
@@ -1938,19 +2164,54 @@ function renderInk() {
     // Apply bloom
     applyBloom(dye.read);
 
-    // Final composite with bloom
-    gl.useProgram(programs.bloomComposite);
-    gl.uniform1i(programs.bloomComposite.uniforms.uTexture, dye.read.attach(0));
-    gl.uniform1i(programs.bloomComposite.uniforms.uBloom0, bloomFBOs[0].a.attach(1));
-    gl.uniform1i(programs.bloomComposite.uniforms.uBloom1, bloomFBOs[1].a.attach(2));
-    gl.uniform1i(programs.bloomComposite.uniforms.uBloom2, bloomFBOs[2].a.attach(3));
-    gl.uniform1f(programs.bloomComposite.uniforms.bloomIntensity, config.BLOOM_INTENSITY);
-    blit(null); // render to screen
+    if (config.BG_TYPE > 0) {
+        // Background texture mode
+        const prog = programs.bgDisplay;
+        gl.useProgram(prog);
+        gl.uniform1i(prog.uniforms.uDye, dye.read.attach(0));
+        gl.uniform1i(prog.uniforms.uBloom0, bloomFBOs[0].a.attach(1));
+        gl.uniform1i(prog.uniforms.uBloom1, bloomFBOs[1].a.attach(2));
+        gl.uniform1i(prog.uniforms.uBloom2, bloomFBOs[2].a.attach(3));
+        gl.uniform1f(prog.uniforms.bloomIntensity, config.BLOOM_INTENSITY);
+        gl.uniform1i(prog.uniforms.bgType, config.BG_TYPE);
+        gl.uniform1f(prog.uniforms.time, performance.now() * 0.001);
+        blit(null);
+    } else {
+        // Standard dark composite with bloom
+        gl.useProgram(programs.bloomComposite);
+        gl.uniform1i(programs.bloomComposite.uniforms.uTexture, dye.read.attach(0));
+        gl.uniform1i(programs.bloomComposite.uniforms.uBloom0, bloomFBOs[0].a.attach(1));
+        gl.uniform1i(programs.bloomComposite.uniforms.uBloom1, bloomFBOs[1].a.attach(2));
+        gl.uniform1i(programs.bloomComposite.uniforms.uBloom2, bloomFBOs[2].a.attach(3));
+        gl.uniform1f(programs.bloomComposite.uniforms.bloomIntensity, config.BLOOM_INTENSITY);
+        blit(null);
+    }
 
     // Render particles on top
     renderParticles();
 
     // Render well indicators
+    renderWellIndicators();
+}
+
+function renderImageDistort() {
+    applyBloom(dye.read);
+
+    const prog = programs.imageDistort;
+    gl.useProgram(prog);
+    gl.uniform1i(prog.uniforms.uImage, attachImageTexture(0));
+    gl.uniform1i(prog.uniforms.uVelocity, velocity.read.attach(1));
+    gl.uniform1i(prog.uniforms.uDye, dye.read.attach(2));
+    gl.uniform1i(prog.uniforms.uBloom0, bloomFBOs[0].a.attach(3));
+    gl.uniform1i(prog.uniforms.uBloom1, bloomFBOs[1].a.attach(4));
+    gl.uniform1i(prog.uniforms.uBloom2, bloomFBOs[2].a.attach(5));
+    gl.uniform1f(prog.uniforms.bloomIntensity, config.BLOOM_INTENSITY);
+    gl.uniform2f(prog.uniforms.texelSize, 1.0 / velocity.read.width, 1.0 / velocity.read.height);
+    gl.uniform1f(prog.uniforms.distortStrength, config.IMAGE_DISTORT_STRENGTH);
+    gl.uniform1f(prog.uniforms.dyeBlend, config.IMAGE_DYE_BLEND);
+    blit(null);
+
+    renderParticles();
     renderWellIndicators();
 }
 
@@ -2025,8 +2286,7 @@ document.getElementById('vorticity').addEventListener('input', (e) => {
 // Palette cycle
 document.getElementById('palette-btn').addEventListener('click', () => {
     config.paletteIndex = (config.paletteIndex + 1) % PALETTES.length;
-    const names = ['Vivid', 'Ocean', 'Fire', 'Neon', 'Pastel'];
-    document.getElementById('palette-btn').textContent = names[config.paletteIndex];
+    document.getElementById('palette-btn').textContent = PALETTE_NAMES[config.paletteIndex];
     // Update active pointer colours
     for (const [, p] of pointers) p.color = randomColor();
 });
@@ -2168,6 +2428,39 @@ document.getElementById('copy-room-btn').addEventListener('click', () => {
 document.getElementById('battle-btn').addEventListener('click', () => {
     if (battleActive) return;
     startBattle();
+});
+
+// Symmetry toggle
+const symModes = [0, 2, 4, 6, 8];
+const symNames = ['Off', 'Mirror', '4-fold', '6-fold', '8-fold'];
+let symIndex = 0;
+document.getElementById('symmetry-btn').addEventListener('click', () => {
+    symIndex = (symIndex + 1) % symModes.length;
+    config.SYMMETRY = symModes[symIndex];
+    const btn = document.getElementById('symmetry-btn');
+    btn.textContent = 'Sym: ' + symNames[symIndex];
+    btn.classList.toggle('active', config.SYMMETRY > 0);
+});
+
+// Image button
+document.getElementById('image-btn').addEventListener('click', () => {
+    if (config.IMAGE_MODE) {
+        config.IMAGE_MODE = false;
+        document.getElementById('image-btn').textContent = 'Image';
+    } else {
+        document.getElementById('image-file').click();
+    }
+});
+
+document.getElementById('image-file').addEventListener('change', (e) => {
+    if (e.target.files.length > 0) loadImage(e.target.files[0]);
+});
+
+// Background cycle
+const bgNames = ['BG: Dark', 'BG: Marble', 'BG: Paper', 'BG: Deep'];
+document.getElementById('bg-btn').addEventListener('click', () => {
+    config.BG_TYPE = (config.BG_TYPE + 1) % 4;
+    document.getElementById('bg-btn').textContent = bgNames[config.BG_TYPE];
 });
 
 // Auto-join room from URL
