@@ -49,6 +49,27 @@ canvas {
     70% { opacity: 0.8; transform: translate(-50%, calc(-50% - 30px)) scale(1); }
     100% { opacity: 0; transform: translate(-50%, calc(-50% - 60px)) scale(1.05); }
 }
+@keyframes voiceReveal {
+    0% { opacity: 0; transform: translate(-50%, -50%) scale(0.3); filter: blur(8px); }
+    15% { opacity: 1; transform: translate(-50%, -50%) scale(1.1); filter: blur(0); }
+    25% { transform: translate(-50%, -50%) scale(1); }
+    80% { opacity: 0.7; transform: translate(-50%, calc(-50% - 20px)) scale(1); }
+    100% { opacity: 0; transform: translate(-50%, calc(-50% - 50px)) scale(1.1); filter: blur(4px); }
+}
+@keyframes voiceWave {
+    0% { opacity: 0; transform: translate(-50%, -50%) scaleX(0.5) scaleY(1.5); }
+    10% { opacity: 1; transform: translate(-50%, -50%) scaleX(1) scaleY(1); }
+    50% { transform: translate(-50%, calc(-50% - 15px)) scaleX(1.02) scaleY(0.98); }
+    75% { opacity: 0.6; transform: translate(-50%, calc(-50% - 35px)) scaleX(0.98) scaleY(1.02); }
+    100% { opacity: 0; transform: translate(-50%, calc(-50% - 60px)) scaleX(1.05) scaleY(0.95); }
+}
+@keyframes voiceGlow {
+    0% { opacity: 0; text-shadow: 0 0 40px currentColor; transform: translate(-50%, -50%) scale(2); }
+    20% { opacity: 1; text-shadow: 0 0 20px currentColor, 0 0 40px currentColor; transform: translate(-50%, -50%) scale(1); }
+    60% { opacity: 0.9; text-shadow: 0 0 10px currentColor; }
+    100% { opacity: 0; text-shadow: 0 0 60px currentColor; transform: translate(-50%, calc(-50% - 40px)) scale(1.2); }
+}
+#mic-btn.listening { background: rgba(255,100,100,0.5); animation: pulse-red 1.5s infinite; }
 #msg-bar input:focus { border-color: rgba(255,255,255,0.4); }
 #record-btn.recording { background: rgba(255,50,50,0.5); animation: pulse-red 1s infinite; }
 @keyframes pulse-red { 0%,100% { box-shadow: 0 0 0 0 rgba(255,0,0,0.4); } 50% { box-shadow: 0 0 0 6px rgba(255,0,0,0); } }
@@ -90,7 +111,7 @@ canvas {
     <button class="ctrl-item" id="room-btn">Share</button>
     <button class="ctrl-item" id="screenshot-btn">Save</button>
     <button class="ctrl-item toggle-btn" id="mode-btn">Ink</button>
-    <button class="ctrl-item" id="mic-btn">Mic</button>
+    <button class="ctrl-item" id="mic-btn">Voice</button>
     <button class="ctrl-item" id="gyro-btn">Gyro</button>
     <button class="ctrl-item toggle-btn" id="particles-btn">Particles</button>
     <button class="ctrl-item toggle-btn" id="walls-btn">Draw</button>
@@ -1224,6 +1245,30 @@ function handleMotion(e) {
 let micEnabled = false;
 let audioAmplitude = 0;
 let audioContext, analyser, micStream;
+let speechRecognition = null;
+let speechActive = false;
+
+// Artistic text style presets for voice messages
+const voiceStyles = [
+    { font: 'italic 28px Georgia, serif', anim: 'voiceReveal', duration: 14000, spacing: '2px' },
+    { font: 'bold 34px "Palatino Linotype", "Book Antiqua", serif', anim: 'voiceGlow', duration: 12000, spacing: '3px' },
+    { font: '300 26px "Segoe UI", Helvetica, sans-serif', anim: 'voiceWave', duration: 13000, spacing: '4px' },
+    { font: 'italic bold 30px "Times New Roman", serif', anim: 'voiceReveal', duration: 15000, spacing: '1px' },
+    { font: '24px "Courier New", monospace', anim: 'voiceGlow', duration: 11000, spacing: '5px' },
+    { font: 'italic 32px "Lucida Handwriting", "Comic Sans MS", cursive', anim: 'voiceWave', duration: 14000, spacing: '2px' },
+];
+
+// Warm, intimate color palette for voice text
+const voiceColors = [
+    'rgba(255, 200, 180, 0.9)',
+    'rgba(200, 180, 255, 0.9)',
+    'rgba(180, 230, 255, 0.9)',
+    'rgba(255, 220, 150, 0.9)',
+    'rgba(220, 255, 200, 0.9)',
+    'rgba(255, 180, 220, 0.9)',
+    'rgba(200, 255, 240, 0.9)',
+    'rgba(255, 200, 200, 0.9)',
+];
 
 async function initMicrophone() {
     try {
@@ -1234,11 +1279,122 @@ async function initMicrophone() {
         analyser.fftSize = 256;
         source.connect(analyser);
         micEnabled = true;
-        document.getElementById('mic-btn').textContent = 'Mic: On';
+        document.getElementById('mic-btn').textContent = 'Listening...';
+        document.getElementById('mic-btn').classList.add('listening');
+        initSpeechRecognition();
     } catch (err) {
         console.warn('Microphone access denied:', err);
-        document.getElementById('mic-btn').textContent = 'Mic: Denied';
+        document.getElementById('mic-btn').textContent = 'Voice: Denied';
     }
+}
+
+function initSpeechRecognition() {
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SpeechRecognition) {
+        console.warn('Speech recognition not supported');
+        return;
+    }
+
+    speechRecognition = new SpeechRecognition();
+    speechRecognition.continuous = true;
+    speechRecognition.interimResults = true;
+    speechRecognition.lang = 'en-US';
+    speechActive = true;
+
+    let interimEl = null;
+
+    speechRecognition.onresult = (event) => {
+        let interimTranscript = '';
+        let finalTranscript = '';
+
+        for (let i = event.resultIndex; i < event.results.length; i++) {
+            const transcript = event.results[i][0].transcript.trim();
+            if (event.results[i].isFinal) {
+                finalTranscript += transcript + ' ';
+            } else {
+                interimTranscript += transcript;
+            }
+        }
+
+        // Show interim results as ghostly preview
+        if (interimTranscript && !finalTranscript) {
+            if (!interimEl) {
+                interimEl = document.createElement('div');
+                interimEl.style.cssText = `
+                    position: fixed; bottom: 120px; left: 50%;
+                    transform: translateX(-50%);
+                    font: italic 18px Georgia, serif;
+                    color: rgba(255,255,255,0.35);
+                    text-shadow: 0 0 10px rgba(255,255,255,0.2);
+                    pointer-events: none; z-index: 20;
+                    transition: opacity 0.3s;
+                `;
+                document.body.appendChild(interimEl);
+            }
+            interimEl.textContent = interimTranscript;
+        }
+
+        // Final result → render artistically
+        if (finalTranscript.trim()) {
+            if (interimEl) { interimEl.remove(); interimEl = null; }
+            createArtisticVoiceMessage(finalTranscript.trim());
+        }
+    };
+
+    speechRecognition.onend = () => {
+        if (speechActive && micEnabled) {
+            try { speechRecognition.start(); } catch(e) {}
+        }
+    };
+
+    speechRecognition.onerror = (event) => {
+        if (event.error === 'no-speech') return;
+        console.warn('Speech recognition error:', event.error);
+    };
+
+    try { speechRecognition.start(); } catch(e) {
+        console.warn('Could not start speech recognition:', e);
+    }
+}
+
+function createArtisticVoiceMessage(text) {
+    const container = document.getElementById('floating-msgs');
+    const style = voiceStyles[Math.floor(Math.random() * voiceStyles.length)];
+    const color = voiceColors[Math.floor(Math.random() * voiceColors.length)];
+
+    const el = document.createElement('div');
+    el.textContent = text;
+
+    const x = 15 + Math.random() * 70;
+    const y = 15 + Math.random() * 55;
+
+    el.style.cssText = `
+        position: absolute;
+        left: ${x}%;
+        top: ${y}%;
+        font: ${style.font};
+        color: ${color};
+        letter-spacing: ${style.spacing};
+        text-shadow: 0 0 30px currentColor, 0 2px 15px rgba(0,0,0,0.5);
+        transform: translate(-50%, -50%);
+        animation: ${style.anim} ${style.duration}ms ease-in-out forwards;
+        white-space: nowrap;
+        max-width: 85vw;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        pointer-events: none;
+    `;
+    container.appendChild(el);
+
+    // Paint into fluid
+    paintTextAsDye(text, x / 100, 1.0 - y / 100);
+
+    setTimeout(() => el.remove(), style.duration);
+
+    // Broadcast to partner
+    broadcastMessage({ type: 'message', text, voice: true });
+
+    floatingMsgs.push({ el, x, y, time: performance.now() });
 }
 
 function updateAudioAmplitude() {
@@ -1251,6 +1407,11 @@ function updateAudioAmplitude() {
 }
 
 function stopMicrophone() {
+    if (speechRecognition) {
+        speechActive = false;
+        try { speechRecognition.stop(); } catch(e) {}
+        speechRecognition = null;
+    }
     if (micStream) {
         micStream.getTracks().forEach(t => t.stop());
         micStream = null;
@@ -1261,7 +1422,8 @@ function stopMicrophone() {
     }
     micEnabled = false;
     audioAmplitude = 0;
-    document.getElementById('mic-btn').textContent = 'Mic: Off';
+    document.getElementById('mic-btn').textContent = 'Voice';
+    document.getElementById('mic-btn').classList.remove('listening');
 }
 
 
@@ -1724,6 +1886,41 @@ function createFloatingMessage(text, fromRemote) {
     floatingMsgs.push({ el, x, y, time: performance.now() });
 }
 
+function createArtisticVoiceMessage_remote(text) {
+    // Same as createArtisticVoiceMessage but without broadcasting back
+    const container = document.getElementById('floating-msgs');
+    const style = voiceStyles[Math.floor(Math.random() * voiceStyles.length)];
+    const color = voiceColors[Math.floor(Math.random() * voiceColors.length)];
+
+    const el = document.createElement('div');
+    el.textContent = text;
+
+    const x = 15 + Math.random() * 70;
+    const y = 15 + Math.random() * 55;
+
+    el.style.cssText = `
+        position: absolute;
+        left: ${x}%;
+        top: ${y}%;
+        font: ${style.font};
+        color: ${color};
+        letter-spacing: ${style.spacing};
+        text-shadow: 0 0 30px currentColor, 0 2px 15px rgba(0,0,0,0.5);
+        transform: translate(-50%, -50%);
+        animation: ${style.anim} ${style.duration}ms ease-in-out forwards;
+        white-space: nowrap;
+        max-width: 85vw;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        pointer-events: none;
+    `;
+    container.appendChild(el);
+
+    paintTextAsDye(text, x / 100, 1.0 - y / 100);
+    setTimeout(() => el.remove(), style.duration);
+    floatingMsgs.push({ el, x, y, time: performance.now() });
+}
+
 function paintTextAsDye(text, x, y) {
     // Render text to an offscreen canvas, then splat it as dye
     if (!msgCanvas) {
@@ -1987,7 +2184,11 @@ function handleRemoteMessage(msg, peerId) {
             startBattleLocal(msg.teams);
             break;
         case 'message':
-            createFloatingMessage(msg.text, true);
+            if (msg.voice) {
+                createArtisticVoiceMessage_remote(msg.text);
+            } else {
+                createFloatingMessage(msg.text, true);
+            }
             break;
         case 'photo':
             receiveSharedPhoto(msg.dataUrl);
