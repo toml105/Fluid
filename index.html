@@ -43,6 +43,13 @@ canvas {
     background: #fff; cursor: pointer;
 }
 #collapse-btn { font-size: 16px; line-height: 1; padding: 4px 8px; }
+@keyframes msgFloat {
+    0% { opacity: 0; transform: translate(-50%, -50%) scale(0.8); }
+    8% { opacity: 1; transform: translate(-50%, -50%) scale(1); }
+    70% { opacity: 0.8; transform: translate(-50%, calc(-50% - 30px)) scale(1); }
+    100% { opacity: 0; transform: translate(-50%, calc(-50% - 60px)) scale(1.05); }
+}
+#msg-bar input:focus { border-color: rgba(255,255,255,0.4); }
 #record-btn.recording { background: rgba(255,50,50,0.5); animation: pulse-red 1s infinite; }
 @keyframes pulse-red { 0%,100% { box-shadow: 0 0 0 0 rgba(255,0,0,0.4); } 50% { box-shadow: 0 0 0 6px rgba(255,0,0,0); } }
 .remote-cursor { position:fixed; width:12px; height:12px; border-radius:50%; pointer-events:none; z-index:15; border:2px solid rgba(255,255,255,0.6); transform:translate(-50%,-50%); transition:left 0.08s linear, top 0.08s linear; }
@@ -76,20 +83,21 @@ canvas {
         <input type="range" id="vorticity" min="0" max="100" value="30">
     </div>
     <button class="ctrl-item" id="palette-btn">Palette</button>
-    <button class="ctrl-item" id="screenshot-btn">Screenshot</button>
+    <button class="ctrl-item" id="image-btn">Photo</button>
+    <button class="ctrl-item toggle-btn" id="msg-btn" title="Send a message">Msg</button>
+    <button class="ctrl-item toggle-btn" id="symmetry-btn">Sym</button>
+    <button class="ctrl-item" id="bg-btn">BG</button>
+    <button class="ctrl-item" id="room-btn">Share</button>
+    <button class="ctrl-item" id="screenshot-btn">Save</button>
     <button class="ctrl-item toggle-btn" id="mode-btn">Ink</button>
-    <button class="ctrl-item" id="mic-btn">Mic: Off</button>
-    <button class="ctrl-item" id="gyro-btn">Gyro: Off</button>
+    <button class="ctrl-item" id="mic-btn">Mic</button>
+    <button class="ctrl-item" id="gyro-btn">Gyro</button>
     <button class="ctrl-item toggle-btn" id="particles-btn">Particles</button>
-    <button class="ctrl-item toggle-btn" id="walls-btn">Walls</button>
-    <button class="ctrl-item" id="clear-walls-btn">Clear Walls</button>
-    <button class="ctrl-item toggle-btn" id="record-btn">Record</button>
+    <button class="ctrl-item toggle-btn" id="walls-btn">Draw</button>
+    <button class="ctrl-item" id="clear-walls-btn">Clear</button>
+    <button class="ctrl-item toggle-btn" id="record-btn">Rec</button>
     <button class="ctrl-item" id="music-btn">Music</button>
-    <button class="ctrl-item" id="room-btn">Room</button>
     <button class="ctrl-item" id="battle-btn">Battle</button>
-    <button class="ctrl-item toggle-btn" id="symmetry-btn">Symmetry</button>
-    <button class="ctrl-item" id="image-btn">Image</button>
-    <button class="ctrl-item" id="bg-btn">BG: Dark</button>
     <button class="ctrl-item toggle-btn" id="living-btn">Living</button>
     <button class="ctrl-item toggle-btn" id="autopaint-btn">Auto</button>
 </div>
@@ -128,6 +136,23 @@ canvas {
 <div id="battle-winner" style="display:none; position:fixed; top:50%; left:50%; transform:translate(-50%,-50%);
     font-size:36px; font-weight:bold; color:#fff; text-shadow:0 0 20px rgba(255,255,255,0.8);
     z-index:30; font-family:-apple-system,sans-serif; pointer-events:none;"></div>
+
+<!-- Message input -->
+<div id="msg-bar" style="position:fixed; bottom:80px; left:50%; transform:translateX(-50%);
+    display:none; z-index:20; width:calc(100% - 32px); max-width:400px;">
+    <form id="msg-form" style="display:flex; gap:8px;">
+        <input id="msg-input" type="text" placeholder="Type a feeling..." maxlength="80"
+            style="flex:1; background:rgba(0,0,0,0.7); backdrop-filter:blur(12px); border:1px solid rgba(255,255,255,0.2);
+            color:#fff; padding:12px 16px; border-radius:24px; font-size:15px; font-family:-apple-system,sans-serif;
+            outline:none;" autocomplete="off">
+        <button type="submit" style="background:rgba(255,255,255,0.15); border:none; color:#fff; width:44px; height:44px;
+            border-radius:50%; font-size:18px; cursor:pointer; display:flex; align-items:center; justify-content:center;">&#10148;</button>
+    </form>
+</div>
+
+<!-- Floating messages container -->
+<div id="floating-msgs" style="position:fixed; top:0; left:0; width:100%; height:100%; pointer-events:none; z-index:5;
+    font-family:'Georgia','Times New Roman',serif; overflow:hidden;"></div>
 
 <div id="perm-prompt">
     <h3 id="perm-title">Permission Required</h3>
@@ -1039,7 +1064,8 @@ const programs = {
 // FBOs - will be initialized in initFBOs
 let velocity, pressure, divergence, curlFBO, dye;
 let bloomFBOs = []; // downsampled FBOs for bloom chain
-let obstacleFBO; // obstacle texture
+let obstacleFBO; // obstacle texture (double buffered for draw operations)
+let obstacleDouble; // second obstacle FBO for ping-pong
 let chemicalsFBO; // reaction-diffusion chemicals (RG = A, B)
 
 function getResolution(resolution) {
@@ -1064,8 +1090,9 @@ function initFBOs() {
     curlFBO = createFBO(simW, simH, formatR.internalFormat, formatR.format, texType, gl.NEAREST);
     dye = createDoubleFBO(dyeW, dyeH, formatRGBA.internalFormat, formatRGBA.format, texType, gl.LINEAR);
 
-    // Obstacle FBO (sim resolution, RGBA8)
+    // Obstacle FBOs (double-buffered for drawing)
     obstacleFBO = createFBO(simW, simH, isWebGL2 ? gl.RGBA8 : gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, gl.NEAREST);
+    obstacleDouble = createFBO(simW, simH, isWebGL2 ? gl.RGBA8 : gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, gl.NEAREST);
 
     // Chemical FBO for reaction-diffusion (sim resolution, needs float)
     chemicalsFBO = createDoubleFBO(simW, simH, formatRGBA.internalFormat, formatRGBA.format, texType, gl.LINEAR);
@@ -1529,6 +1556,7 @@ function stepAutoPaint(dt) {
 // ============================================================
 
 function drawObstacle(x, y, erase) {
+    // Draw into obstacleDouble, reading from obstacleFBO
     const prog = programs.obstacleDraw;
     gl.useProgram(prog);
     gl.uniform1i(prog.uniforms.uTexture, obstacleFBO.attach(0));
@@ -1536,18 +1564,11 @@ function drawObstacle(x, y, erase) {
     gl.uniform1f(prog.uniforms.radius, config.WALL_RADIUS);
     gl.uniform1f(prog.uniforms.aspectRatio, canvas.width / canvas.height);
     gl.uniform1f(prog.uniforms.erase, erase ? 1.0 : 0.0);
-    // Need a temp FBO to avoid read/write same texture
-    const tempObs = createFBO(obstacleFBO.width, obstacleFBO.height,
-        isWebGL2 ? gl.RGBA8 : gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, gl.NEAREST);
-    blit(tempObs);
-    // Copy back
-    gl.useProgram(programs.clear);
-    gl.uniform1i(programs.clear.uniforms.uTexture, tempObs.attach(0));
-    gl.uniform1f(programs.clear.uniforms.value, 1.0);
-    blit(obstacleFBO);
-    // Clean up temp
-    gl.deleteTexture(tempObs.texture);
-    gl.deleteFramebuffer(tempObs.fbo);
+    blit(obstacleDouble);
+    // Swap: obstacleDouble becomes the new obstacleFBO
+    const tmp = obstacleFBO;
+    obstacleFBO = obstacleDouble;
+    obstacleDouble = tmp;
     broadcastMessage({ type: 'obstacle', x, y, radius: config.WALL_RADIUS, erase: !!erase });
 }
 
@@ -1591,12 +1612,57 @@ function attachImageTexture(unit) {
     return unit;
 }
 
+// Share photo with partner
+function sharePhoto(file) {
+    // Load, display locally, and send to partner
+    loadImage(file);
+    // Convert to data URL for sharing (resize first for bandwidth)
+    const reader = new FileReader();
+    reader.onload = () => {
+        // Resize to max 800px for sharing
+        const img = new Image();
+        img.onload = () => {
+            const c = document.createElement('canvas');
+            const maxDim = 800;
+            let w = img.width, h = img.height;
+            if (w > maxDim || h > maxDim) {
+                if (w > h) { h = Math.round(h * maxDim / w); w = maxDim; }
+                else { w = Math.round(w * maxDim / h); h = maxDim; }
+            }
+            c.width = w; c.height = h;
+            c.getContext('2d').drawImage(img, 0, 0, w, h);
+            const dataUrl = c.toDataURL('image/jpeg', 0.7);
+            broadcastMessage({ type: 'photo', dataUrl });
+        };
+        img.src = reader.result;
+    };
+    reader.readAsDataURL(file);
+}
+
+function receiveSharedPhoto(dataUrl) {
+    // Load shared photo from data URL
+    const img = new Image();
+    img.onload = () => {
+        if (imageTexture) gl.deleteTexture(imageTexture);
+        imageTexture = gl.createTexture();
+        gl.bindTexture(gl.TEXTURE_2D, imageTexture);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, img);
+        imageLoaded = true;
+        config.IMAGE_MODE = true;
+    };
+    img.src = dataUrl;
+}
+
 // Drag and drop image support
 canvas.addEventListener('dragover', (e) => { e.preventDefault(); e.dataTransfer.dropEffect = 'copy'; });
 canvas.addEventListener('drop', (e) => {
     e.preventDefault();
     const file = e.dataTransfer.files[0];
-    if (file && file.type.startsWith('image/')) loadImage(file);
+    if (file && file.type.startsWith('image/')) sharePhoto(file);
 });
 
 // Paste image support
@@ -1604,11 +1670,95 @@ document.addEventListener('paste', (e) => {
     const items = e.clipboardData.items;
     for (const item of items) {
         if (item.type.startsWith('image/')) {
-            loadImage(item.getAsFile());
+            sharePhoto(item.getAsFile());
             break;
         }
     }
 });
+
+// ============================================================
+// SECTION 5d2b: Floating Messages
+// ============================================================
+
+const floatingMsgs = [];
+let msgCanvas = null;
+let msgCtx = null;
+
+function createFloatingMessage(text, fromRemote) {
+    const container = document.getElementById('floating-msgs');
+
+    // Create a DOM element that floats and fades
+    const el = document.createElement('div');
+    el.textContent = text;
+    const size = 18 + Math.random() * 14;
+    const x = 10 + Math.random() * 80; // percent
+    const y = 20 + Math.random() * 50;
+    el.style.cssText = `
+        position: absolute;
+        left: ${x}%;
+        top: ${y}%;
+        font-size: ${size}px;
+        color: rgba(255,255,255,0.85);
+        text-shadow: 0 0 20px rgba(255,255,255,0.4), 0 2px 10px rgba(0,0,0,0.6);
+        letter-spacing: 1px;
+        transform: translate(-50%, -50%);
+        animation: msgFloat 12s ease-in-out forwards;
+        white-space: nowrap;
+        max-width: 90vw;
+        overflow: hidden;
+        text-overflow: ellipsis;
+    `;
+    container.appendChild(el);
+
+    // Also paint the text as dye into the fluid
+    paintTextAsDye(text, x / 100, 1.0 - y / 100);
+
+    // Remove after animation
+    setTimeout(() => el.remove(), 12000);
+
+    // Broadcast to partner
+    if (!fromRemote) {
+        broadcastMessage({ type: 'message', text });
+    }
+
+    floatingMsgs.push({ el, x, y, time: performance.now() });
+}
+
+function paintTextAsDye(text, x, y) {
+    // Render text to an offscreen canvas, then splat it as dye
+    if (!msgCanvas) {
+        msgCanvas = document.createElement('canvas');
+        msgCtx = msgCanvas.getContext('2d');
+    }
+    msgCanvas.width = 512;
+    msgCanvas.height = 64;
+    msgCtx.clearRect(0, 0, 512, 64);
+    msgCtx.fillStyle = '#fff';
+    msgCtx.font = 'bold 32px Georgia, serif';
+    msgCtx.textAlign = 'center';
+    msgCtx.textBaseline = 'middle';
+    msgCtx.fillText(text, 256, 32);
+
+    // Upload as texture
+    const tex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, msgCanvas);
+
+    // Splat the text as a wide gentle force + dye
+    const color = randomColor();
+    const spread = 0.15;
+    for (let i = -2; i <= 2; i++) {
+        const sx = x + i * spread * 0.1;
+        const angle = Math.random() * Math.PI * 2;
+        splat(sx, y, Math.cos(angle) * 500, Math.sin(angle) * 500, color);
+    }
+
+    gl.deleteTexture(tex);
+}
 
 // ============================================================
 // SECTION 5d3: Symmetry System
@@ -1820,30 +1970,29 @@ function handleRemoteMessage(msg, peerId) {
         case 'well':
             // Legacy — wells removed
             break;
-        case 'obstacle':
-            // Draw obstacle locally without re-broadcasting
-            const prog = programs.obstacleDraw;
-            gl.useProgram(prog);
-            gl.uniform1i(prog.uniforms.uTexture, obstacleFBO.attach(0));
-            gl.uniform2f(prog.uniforms.point, msg.x, msg.y);
-            gl.uniform1f(prog.uniforms.radius, msg.radius);
-            gl.uniform1f(prog.uniforms.aspectRatio, canvas.width / canvas.height);
-            gl.uniform1f(prog.uniforms.erase, msg.erase ? 1.0 : 0.0);
-            const tmp = createFBO(obstacleFBO.width, obstacleFBO.height,
-                isWebGL2 ? gl.RGBA8 : gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, gl.NEAREST);
-            blit(tmp);
-            gl.useProgram(programs.clear);
-            gl.uniform1i(programs.clear.uniforms.uTexture, tmp.attach(0));
-            gl.uniform1f(programs.clear.uniforms.value, 1.0);
-            blit(obstacleFBO);
-            gl.deleteTexture(tmp.texture);
-            gl.deleteFramebuffer(tmp.fbo);
+        case 'obstacle': {
+            // Draw obstacle locally without re-broadcasting (use ping-pong)
+            const op = programs.obstacleDraw;
+            gl.useProgram(op);
+            gl.uniform1i(op.uniforms.uTexture, obstacleFBO.attach(0));
+            gl.uniform2f(op.uniforms.point, msg.x, msg.y);
+            gl.uniform1f(op.uniforms.radius, msg.radius);
+            gl.uniform1f(op.uniforms.aspectRatio, canvas.width / canvas.height);
+            gl.uniform1f(op.uniforms.erase, msg.erase ? 1.0 : 0.0);
+            blit(obstacleDouble);
+            const ot = obstacleFBO; obstacleFBO = obstacleDouble; obstacleDouble = ot;
             break;
+        }
         case 'battle-start':
             startBattleLocal(msg.teams);
             break;
+        case 'message':
+            createFloatingMessage(msg.text, true);
+            break;
+        case 'photo':
+            receiveSharedPhoto(msg.dataUrl);
+            break;
         case 'identity':
-            // Store remote player color
             break;
     }
 }
@@ -2410,7 +2559,6 @@ function renderImageDistort() {
     blit(null);
 
     renderParticles();
-    renderWellIndicators();
 }
 
 function applyBloom(source) {
@@ -2601,6 +2749,25 @@ document.getElementById('battle-btn').addEventListener('click', () => {
     startBattle();
 });
 
+// Message toggle
+document.getElementById('msg-btn').addEventListener('click', () => {
+    const bar = document.getElementById('msg-bar');
+    const visible = bar.style.display !== 'none';
+    bar.style.display = visible ? 'none' : 'block';
+    document.getElementById('msg-btn').classList.toggle('active', !visible);
+    if (!visible) document.getElementById('msg-input').focus();
+});
+
+document.getElementById('msg-form').addEventListener('submit', (e) => {
+    e.preventDefault();
+    const input = document.getElementById('msg-input');
+    const text = input.value.trim();
+    if (text) {
+        createFloatingMessage(text, false);
+        input.value = '';
+    }
+});
+
 // Symmetry toggle
 const symModes = [0, 2, 4, 6, 8];
 const symNames = ['Off', 'Mirror', '4-fold', '6-fold', '8-fold'];
@@ -2624,7 +2791,7 @@ document.getElementById('image-btn').addEventListener('click', () => {
 });
 
 document.getElementById('image-file').addEventListener('change', (e) => {
-    if (e.target.files.length > 0) loadImage(e.target.files[0]);
+    if (e.target.files.length > 0) sharePhoto(e.target.files[0]);
 });
 
 // Background cycle
