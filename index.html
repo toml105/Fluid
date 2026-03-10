@@ -83,7 +83,6 @@ canvas {
     <button class="ctrl-item toggle-btn" id="particles-btn">Particles</button>
     <button class="ctrl-item toggle-btn" id="walls-btn">Walls</button>
     <button class="ctrl-item" id="clear-walls-btn">Clear Walls</button>
-    <button class="ctrl-item toggle-btn" id="wells-btn">Wells</button>
     <button class="ctrl-item toggle-btn" id="record-btn">Record</button>
     <button class="ctrl-item" id="music-btn">Music</button>
     <button class="ctrl-item" id="room-btn">Room</button>
@@ -91,6 +90,8 @@ canvas {
     <button class="ctrl-item toggle-btn" id="symmetry-btn">Symmetry</button>
     <button class="ctrl-item" id="image-btn">Image</button>
     <button class="ctrl-item" id="bg-btn">BG: Dark</button>
+    <button class="ctrl-item toggle-btn" id="living-btn">Living</button>
+    <button class="ctrl-item toggle-btn" id="autopaint-btn">Auto</button>
 </div>
 
 <!-- Music file input (hidden) -->
@@ -762,28 +763,109 @@ void main() {
 }
 `).replace(/texture\(/g, isWebGL2 ? 'texture(' : 'texture2D(');
 
-// --- Gravity well force shader ---
-const wellForceFrag = fragSource(`
+// --- Reaction-diffusion shader (Gray-Scott model) ---
+// Creates organic living patterns that flow with the fluid
+const reactionDiffusionFrag = fragSource(`
+uniform sampler2D uChemicals;  // RG = chemical A and B concentrations
 uniform sampler2D uVelocity;
-uniform vec2 wells[8];       // well positions in UV space
-uniform float wellStrengths[8]; // positive = attract, negative = repel
-uniform int wellCount;
+uniform vec2 texelSize;
+uniform float feed;     // feed rate (controls pattern type)
+uniform float kill;     // kill rate
 uniform float dt;
+uniform float diffA;    // diffusion rate A
+uniform float diffB;    // diffusion rate B
+void main() {
+    vec2 chemicals = texture(uChemicals, vUv).rg;
+    float A = chemicals.r;
+    float B = chemicals.g;
+
+    // Laplacian via neighbour sampling
+    vec2 cL = texture(uChemicals, vL).rg;
+    vec2 cR = texture(uChemicals, vR).rg;
+    vec2 cT = texture(uChemicals, vT).rg;
+    vec2 cB = texture(uChemicals, vB).rg;
+
+    float lapA = (cL.r + cR.r + cT.r + cB.r - 4.0 * A);
+    float lapB = (cL.g + cR.g + cT.g + cB.g - 4.0 * B);
+
+    float reaction = A * B * B;
+    float newA = A + (diffA * lapA - reaction + feed * (1.0 - A)) * dt;
+    float newB = B + (diffB * lapB + reaction - (kill + feed) * B) * dt;
+
+    // Advect by velocity (semi-Lagrangian)
+    vec2 vel = texture(uVelocity, vUv).xy;
+    vec2 advected = vUv - vel * texelSize * dt * 0.5;
+    vec2 advChem = texture(uChemicals, advected).rg;
+
+    // Blend between pure reaction-diffusion and advected version
+    newA = mix(newA, advChem.r, 0.3);
+    newB = mix(newB, advChem.g, 0.3);
+
+    fragColor = vec4(clamp(newA, 0.0, 1.0), clamp(newB, 0.0, 1.0), 0.0, 1.0);
+}
+`).replace(/texture\(/g, isWebGL2 ? 'texture(' : 'texture2D(');
+
+// --- Reaction-diffusion display shader ---
+const reactionDisplayFrag = fragSource(`
+uniform sampler2D uChemicals;
+uniform sampler2D uDye;
+uniform sampler2D uBloom0;
+uniform sampler2D uBloom1;
+uniform sampler2D uBloom2;
+uniform float bloomIntensity;
+uniform float time;
+void main() {
+    vec2 chem = texture(uChemicals, vUv).rg;
+    vec3 dyeColor = texture(uDye, vUv).rgb;
+
+    // Map chemical B concentration to beautiful organic colours
+    float b = chem.g;
+
+    // Colour the reaction-diffusion pattern
+    vec3 rdColor;
+    float t = b * 3.0;
+    if (t < 1.0) {
+        rdColor = mix(vec3(0.02, 0.01, 0.04), vec3(0.05, 0.2, 0.4), t);
+    } else if (t < 2.0) {
+        rdColor = mix(vec3(0.05, 0.2, 0.4), vec3(0.8, 0.4, 0.1), t - 1.0);
+    } else {
+        rdColor = mix(vec3(0.8, 0.4, 0.1), vec3(1.0, 0.95, 0.8), clamp(t - 2.0, 0.0, 1.0));
+    }
+
+    // Subtle hue shift over time
+    float hueShift = sin(time * 0.1) * 0.1;
+    rdColor.r += hueShift;
+    rdColor.b -= hueShift;
+
+    // Blend dye on top of the reaction-diffusion pattern
+    vec3 color = rdColor + dyeColor * 0.5;
+
+    // Add bloom
+    vec3 bloom = texture(uBloom0, vUv).rgb * 0.5
+               + texture(uBloom1, vUv).rgb * 0.3
+               + texture(uBloom2, vUv).rgb * 0.2;
+    color += bloom * bloomIntensity;
+
+    color = color / (1.0 + color);
+    color = pow(color, vec3(1.0 / 2.2));
+    fragColor = vec4(color, 1.0);
+}
+`).replace(/texture\(/g, isWebGL2 ? 'texture(' : 'texture2D(');
+
+// --- Chemical seed shader: inject chemical B at touch points ---
+const chemicalSeedFrag = fragSource(`
+uniform sampler2D uChemicals;
+uniform vec2 point;
+uniform float radius;
 uniform float aspectRatio;
 void main() {
-    vec2 vel = texture(uVelocity, vUv).xy;
-    for (int i = 0; i < 8; i++) {
-        if (i >= wellCount) break;
-        vec2 diff = wells[i] - vUv;
-        diff.x *= aspectRatio;
-        float dist = length(diff) + 0.001;
-        vec2 dir = diff / dist;
-        // Inverse-square falloff, capped
-        float force = wellStrengths[i] / (dist * dist + 0.01);
-        force = clamp(force, -500.0, 500.0);
-        vel += dir * force * dt;
-    }
-    fragColor = vec4(vel, 0.0, 1.0);
+    vec2 p = vUv - point;
+    p.x *= aspectRatio;
+    float d = length(p);
+    float seed = smoothstep(radius, radius * 0.3, d);
+    vec2 chem = texture(uChemicals, vUv).rg;
+    chem.g = max(chem.g, seed);
+    fragColor = vec4(chem, 0.0, 1.0);
 }
 `).replace(/texture\(/g, isWebGL2 ? 'texture(' : 'texture2D(');
 
@@ -854,13 +936,16 @@ const config = {
     paletteIndex: 0,
     PARTICLES_ENABLED: false,
     WALLS_MODE: false,
-    WELLS_MODE: false,
     WALL_RADIUS: 0.015,
     SYMMETRY: 0,         // 0=off, 2=mirror, 4=4-fold, 6=6-fold, 8=8-fold
     BG_TYPE: 0,          // 0=dark, 1=marble, 2=watercolor, 3=gradient
     IMAGE_MODE: false,
-    IMAGE_DISTORT_STRENGTH: 15.0,
-    IMAGE_DYE_BLEND: 0.5,
+    IMAGE_DISTORT_STRENGTH: 3.0,  // gentle warping
+    IMAGE_DYE_BLEND: 0.35,
+    LIVING_MODE: false,  // reaction-diffusion
+    RD_FEED: 0.055,      // Gray-Scott feed rate
+    RD_KILL: 0.062,      // Gray-Scott kill rate
+    AUTOPAINT_MODE: false,
 };
 
 // Colour palettes — curated for art
@@ -945,7 +1030,9 @@ const programs = {
     bgDisplay: createProgram(VERT_SHADER, bgDisplayFrag),
     obstacleDraw: createProgram(VERT_SHADER, obstacleDrawFrag),
     obstacleDisplay: createProgram(VERT_SHADER, obstacleDisplayFrag),
-    wellForce: createProgram(VERT_SHADER, wellForceFrag),
+    reactionDiffusion: createProgram(VERT_SHADER, reactionDiffusionFrag),
+    reactionDisplay: createProgram(VERT_SHADER, reactionDisplayFrag),
+    chemicalSeed: createProgram(VERT_SHADER, chemicalSeedFrag),
     particle: createProgram(particleVS, particleFS),
 };
 
@@ -953,6 +1040,7 @@ const programs = {
 let velocity, pressure, divergence, curlFBO, dye;
 let bloomFBOs = []; // downsampled FBOs for bloom chain
 let obstacleFBO; // obstacle texture
+let chemicalsFBO; // reaction-diffusion chemicals (RG = A, B)
 
 function getResolution(resolution) {
     let aspectRatio = gl.drawingBufferWidth / gl.drawingBufferHeight;
@@ -978,6 +1066,11 @@ function initFBOs() {
 
     // Obstacle FBO (sim resolution, RGBA8)
     obstacleFBO = createFBO(simW, simH, isWebGL2 ? gl.RGBA8 : gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, gl.NEAREST);
+
+    // Chemical FBO for reaction-diffusion (sim resolution, needs float)
+    chemicalsFBO = createDoubleFBO(simW, simH, formatRGBA.internalFormat, formatRGBA.format, texType, gl.LINEAR);
+    // Initialize chemical A = 1.0 everywhere, B = 0.0
+    initChemicals();
 
     // Bloom FBOs: progressively downsampled
     bloomFBOs = [];
@@ -1301,53 +1394,134 @@ function renderParticles() {
 }
 
 // ============================================================
-// SECTION 5c: Gravity Wells
+// SECTION 5c: Reaction-Diffusion (Living Mode)
 // ============================================================
 
-const wells = []; // {x, y, strength}
-let wellPlaceTimer = null;
-let wellPlacePos = null;
-
-function addWell(x, y, strength) {
-    if (wells.length >= 8) wells.shift(); // max 8 wells
-    wells.push({ x, y, strength: strength || 200 });
-    broadcastMessage({ type: 'well', action: 'add', x, y, strength: strength || 200 });
+function initChemicals() {
+    if (!chemicalsFBO) return;
+    // Fill chemical A = 1.0, B = 0.0 everywhere
+    // We'll use the clear shader to set initial state
+    gl.bindFramebuffer(gl.FRAMEBUFFER, chemicalsFBO.read.fbo);
+    gl.viewport(0, 0, chemicalsFBO.read.width, chemicalsFBO.read.height);
+    gl.clearColor(1.0, 0.0, 0.0, 1.0); // A=1, B=0
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, chemicalsFBO.write.fbo);
+    gl.viewport(0, 0, chemicalsFBO.write.width, chemicalsFBO.write.height);
+    gl.clearColor(1.0, 0.0, 0.0, 1.0);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
 }
 
-function removeWellNear(x, y) {
-    const threshold = 0.05;
-    for (let i = wells.length - 1; i >= 0; i--) {
-        const dx = wells[i].x - x;
-        const dy = wells[i].y - y;
-        if (Math.sqrt(dx * dx + dy * dy) < threshold) {
-            wells.splice(i, 1);
-            broadcastMessage({ type: 'well', action: 'remove', x, y });
-            return true;
-        }
-    }
-    return false;
-}
-
-function applyWellForces(dt) {
-    if (wells.length === 0) return;
-    const prog = programs.wellForce;
+function seedChemical(x, y) {
+    const prog = programs.chemicalSeed;
     gl.useProgram(prog);
-    gl.uniform2f(prog.uniforms.texelSize, 1.0 / velocity.read.width, 1.0 / velocity.read.height);
-    gl.uniform1i(prog.uniforms.uVelocity, velocity.read.attach(0));
-    gl.uniform1f(prog.uniforms.dt, dt);
+    gl.uniform1i(prog.uniforms.uChemicals, chemicalsFBO.read.attach(0));
+    gl.uniform2f(prog.uniforms.point, x, y);
+    gl.uniform1f(prog.uniforms.radius, 0.02);
     gl.uniform1f(prog.uniforms.aspectRatio, canvas.width / canvas.height);
-    gl.uniform1i(prog.uniforms.wellCount, wells.length);
-    for (let i = 0; i < 8; i++) {
-        if (i < wells.length) {
-            gl.uniform2f(prog.uniforms[`wells[${i}]`], wells[i].x, wells[i].y);
-            gl.uniform1f(prog.uniforms[`wellStrengths[${i}]`], wells[i].strength);
-        } else {
-            gl.uniform2f(prog.uniforms[`wells[${i}]`], 0, 0);
-            gl.uniform1f(prog.uniforms[`wellStrengths[${i}]`], 0);
+    blit(chemicalsFBO.write);
+    chemicalsFBO.swap();
+}
+
+function stepReactionDiffusion(dt) {
+    if (!config.LIVING_MODE) return;
+
+    // Run multiple RD steps per frame for visible evolution
+    const rdSteps = 8;
+    const rdDt = 1.0;
+
+    for (let s = 0; s < rdSteps; s++) {
+        const prog = programs.reactionDiffusion;
+        gl.useProgram(prog);
+        gl.uniform2f(prog.uniforms.texelSize,
+            1.0 / chemicalsFBO.read.width, 1.0 / chemicalsFBO.read.height);
+        gl.uniform1i(prog.uniforms.uChemicals, chemicalsFBO.read.attach(0));
+        gl.uniform1i(prog.uniforms.uVelocity, velocity.read.attach(1));
+        gl.uniform1f(prog.uniforms.feed, config.RD_FEED);
+        gl.uniform1f(prog.uniforms.kill, config.RD_KILL);
+        gl.uniform1f(prog.uniforms.dt, rdDt);
+        gl.uniform1f(prog.uniforms.diffA, 1.0);
+        gl.uniform1f(prog.uniforms.diffB, 0.5);
+        blit(chemicalsFBO.write);
+        chemicalsFBO.swap();
+    }
+}
+
+// ============================================================
+// SECTION 5c2: Auto-Paint (Generative Art Mode)
+// ============================================================
+
+let autoPaintTimer = 0;
+let autoPaintPhase = 0;
+
+function stepAutoPaint(dt) {
+    if (!config.AUTOPAINT_MODE) return;
+
+    autoPaintTimer += dt;
+
+    // Slow, deliberate brushstrokes that evolve over time
+    // Creates art autonomously — like a patient painter
+
+    // Breathing pulse: gentle force from center
+    if (autoPaintTimer > 0.1) {
+        autoPaintTimer = 0;
+        autoPaintPhase += 0.02;
+
+        // Organic curve path — Lissajous-like motion
+        const t = autoPaintPhase;
+        const x = 0.5 + 0.3 * Math.sin(t * 1.3 + Math.sin(t * 0.7));
+        const y = 0.5 + 0.3 * Math.cos(t * 0.9 + Math.cos(t * 1.1));
+        const prevX = 0.5 + 0.3 * Math.sin((t - 0.02) * 1.3 + Math.sin((t - 0.02) * 0.7));
+        const prevY = 0.5 + 0.3 * Math.cos((t - 0.02) * 0.9 + Math.cos((t - 0.02) * 1.1));
+
+        const dx = (x - prevX) * 4000;
+        const dy = (y - prevY) * 4000;
+
+        // Slowly shifting colour through golden ratio
+        const color = goldenRatioColor();
+
+        splatWithSymmetry(x, y, dx, dy, color);
+
+        // Seed chemicals at paint point if living mode is on
+        if (config.LIVING_MODE) {
+            seedChemical(x, y);
+        }
+
+        // Spawn particles if enabled
+        if (config.PARTICLES_ENABLED) {
+            for (let i = 0; i < 3; i++) {
+                spawnParticle(
+                    x + (Math.random() - 0.5) * 0.03,
+                    y + (Math.random() - 0.5) * 0.03,
+                    color.r, color.g, color.b
+                );
+            }
+        }
+
+        // Occasionally add a second stroke from a different curve
+        if (Math.sin(t * 2.7) > 0.6) {
+            const x2 = 0.5 + 0.25 * Math.cos(t * 1.7 + 2.0);
+            const y2 = 0.5 + 0.25 * Math.sin(t * 1.1 + 1.0);
+            const prevX2 = 0.5 + 0.25 * Math.cos((t - 0.02) * 1.7 + 2.0);
+            const prevY2 = 0.5 + 0.25 * Math.sin((t - 0.02) * 1.1 + 1.0);
+            const color2 = goldenRatioColor();
+            splatWithSymmetry(x2, y2, (x2 - prevX2) * 3000, (y2 - prevY2) * 3000, color2);
         }
     }
-    blit(velocity.write);
-    velocity.swap();
+
+    // Gentle breathing force — makes the whole canvas feel alive
+    const breathe = Math.sin(autoPaintPhase * 3.0) * 0.5;
+    if (Math.abs(breathe) > 0.3) {
+        const prog = programs.splat;
+        gl.useProgram(prog);
+        gl.uniform1i(prog.uniforms.uTarget, velocity.read.attach(0));
+        gl.uniform1f(prog.uniforms.aspectRatio, canvas.width / canvas.height);
+        gl.uniform2f(prog.uniforms.point, 0.5, 0.5);
+        gl.uniform3f(prog.uniforms.color, breathe * 100, breathe * 50 * Math.cos(autoPaintPhase * 1.5), 0.0);
+        gl.uniform1f(prog.uniforms.radius, correctRadius(0.8));
+        blit(velocity.write);
+        velocity.swap();
+    }
 }
 
 // ============================================================
@@ -1644,8 +1818,7 @@ function handleRemoteMessage(msg, peerId) {
             updateRemoteCursor(peerId, msg.x, msg.y, msg.color);
             break;
         case 'well':
-            if (msg.action === 'add') wells.push({ x: msg.x, y: msg.y, strength: msg.strength });
-            else removeWellNear(msg.x, msg.y);
+            // Legacy — wells removed
             break;
         case 'obstacle':
             // Draw obstacle locally without re-broadcasting
@@ -2034,10 +2207,15 @@ function step(dt) {
         if (config.WALLS_MODE && p.down) {
             drawObstacle(p.x, p.y, false);
         }
+
+        // Seed chemicals at touch points in living mode
+        if (config.LIVING_MODE && p.down && p.moved) {
+            seedChemical(p.x, p.y);
+        }
     }
 
-    // Apply gravity wells
-    applyWellForces(dt);
+    // Auto-paint generative mode
+    stepAutoPaint(dt);
 
     // Apply gyroscope as global force
     if (gyroEnabled && (Math.abs(gyroX) > 0.5 || Math.abs(gyroY) > 0.5)) {
@@ -2138,6 +2316,9 @@ function step(dt) {
     blit(velocity.write);
     velocity.swap();
 
+    // Reaction-diffusion step
+    stepReactionDiffusion(dt);
+
     // Update particles
     updateParticles(dt);
 
@@ -2153,11 +2334,30 @@ function step(dt) {
 function render() {
     if (config.CFD_MODE) {
         renderCFD();
+    } else if (config.LIVING_MODE) {
+        renderLiving();
     } else if (config.IMAGE_MODE && imageLoaded) {
         renderImageDistort();
     } else {
         renderInk();
     }
+}
+
+function renderLiving() {
+    applyBloom(dye.read);
+
+    const prog = programs.reactionDisplay;
+    gl.useProgram(prog);
+    gl.uniform1i(prog.uniforms.uChemicals, chemicalsFBO.read.attach(0));
+    gl.uniform1i(prog.uniforms.uDye, dye.read.attach(1));
+    gl.uniform1i(prog.uniforms.uBloom0, bloomFBOs[0].a.attach(2));
+    gl.uniform1i(prog.uniforms.uBloom1, bloomFBOs[1].a.attach(3));
+    gl.uniform1i(prog.uniforms.uBloom2, bloomFBOs[2].a.attach(4));
+    gl.uniform1f(prog.uniforms.bloomIntensity, config.BLOOM_INTENSITY);
+    gl.uniform1f(prog.uniforms.time, performance.now() * 0.001);
+    blit(null);
+
+    renderParticles();
 }
 
 function renderInk() {
@@ -2190,8 +2390,6 @@ function renderInk() {
     // Render particles on top
     renderParticles();
 
-    // Render well indicators
-    renderWellIndicators();
 }
 
 function renderImageDistort() {
@@ -2258,13 +2456,6 @@ function renderCFD() {
 
     // Render particles on top in CFD mode too
     renderParticles();
-    renderWellIndicators();
-}
-
-function renderWellIndicators() {
-    if (wells.length === 0) return;
-    // Render well positions as pulsing circles using CSS overlays
-    // (keeping it simple — no extra shaders needed)
 }
 
 
@@ -2344,31 +2535,11 @@ document.getElementById('particles-btn').addEventListener('click', () => {
 // Walls toggle
 document.getElementById('walls-btn').addEventListener('click', () => {
     config.WALLS_MODE = !config.WALLS_MODE;
-    config.WELLS_MODE = false; // disable wells mode when walls mode is on
     document.getElementById('walls-btn').classList.toggle('active', config.WALLS_MODE);
-    document.getElementById('wells-btn').classList.remove('active');
 });
 
 // Clear walls
 document.getElementById('clear-walls-btn').addEventListener('click', clearObstacles);
-
-// Wells toggle
-document.getElementById('wells-btn').addEventListener('click', () => {
-    config.WELLS_MODE = !config.WELLS_MODE;
-    config.WALLS_MODE = false;
-    document.getElementById('wells-btn').classList.toggle('active', config.WELLS_MODE);
-    document.getElementById('walls-btn').classList.remove('active');
-});
-
-// Wells: tap to place, tap existing to remove
-canvas.addEventListener('pointerdown', (e) => {
-    if (!config.WELLS_MODE) return;
-    const x = e.clientX / window.innerWidth;
-    const y = 1.0 - e.clientY / window.innerHeight;
-    if (!removeWellNear(x, y)) {
-        addWell(x, y, 200);
-    }
-});
 
 // Right-click erases obstacles
 canvas.addEventListener('contextmenu', (e) => {
@@ -2463,6 +2634,25 @@ document.getElementById('bg-btn').addEventListener('click', () => {
     document.getElementById('bg-btn').textContent = bgNames[config.BG_TYPE];
 });
 
+// Living mode toggle
+document.getElementById('living-btn').addEventListener('click', () => {
+    config.LIVING_MODE = !config.LIVING_MODE;
+    document.getElementById('living-btn').classList.toggle('active', config.LIVING_MODE);
+    if (config.LIVING_MODE) {
+        // Seed a few initial chemical spots to get it started
+        for (let i = 0; i < 5; i++) {
+            seedChemical(0.3 + Math.random() * 0.4, 0.3 + Math.random() * 0.4);
+        }
+    }
+});
+
+// Auto-paint toggle
+document.getElementById('autopaint-btn').addEventListener('click', () => {
+    config.AUTOPAINT_MODE = !config.AUTOPAINT_MODE;
+    document.getElementById('autopaint-btn').classList.toggle('active', config.AUTOPAINT_MODE);
+    autoPaintPhase = Math.random() * 100; // randomize starting point
+});
+
 // Auto-join room from URL
 (function checkURLRoom() {
     const params = new URLSearchParams(window.location.search);
@@ -2476,29 +2666,6 @@ document.getElementById('bg-btn').addEventListener('click', () => {
 // ============================================================
 // SECTION 9: Main Loop
 // ============================================================
-
-// Well indicator dots (managed via DOM for simplicity)
-let wellDots = [];
-function renderWellDots() {
-    // Sync DOM dots with wells array
-    while (wellDots.length < wells.length) {
-        const dot = document.createElement('div');
-        dot.style.cssText = 'position:fixed;width:16px;height:16px;border-radius:50%;pointer-events:none;z-index:12;border:2px solid rgba(255,255,255,0.8);background:rgba(100,200,255,0.3);transform:translate(-50%,-50%);';
-        document.body.appendChild(dot);
-        wellDots.push(dot);
-    }
-    while (wellDots.length > wells.length) {
-        wellDots.pop().remove();
-    }
-    for (let i = 0; i < wells.length; i++) {
-        const w = wells[i];
-        wellDots[i].style.left = (w.x * window.innerWidth) + 'px';
-        wellDots[i].style.top = ((1 - w.y) * window.innerHeight) + 'px';
-        const pulse = 0.8 + 0.4 * Math.sin(performance.now() * 0.005 + i);
-        wellDots[i].style.transform = `translate(-50%,-50%) scale(${pulse})`;
-        wellDots[i].style.borderColor = w.strength > 0 ? 'rgba(100,200,255,0.8)' : 'rgba(255,100,100,0.8)';
-    }
-}
 
 let lastTime = 0;
 
@@ -2518,9 +2685,6 @@ function animate(time) {
 
     // Render to screen
     render();
-
-    // Render well position indicators as simple dots
-    renderWellDots();
 }
 
 // Generate a few initial splats so the screen isn't blank
